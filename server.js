@@ -15,7 +15,11 @@ let sockets = []
 let connectedClients = 0
 
 wss.on('connection', (ws) => {
+  console.log('웹소켓 연결확인')
   ws.send(JSON.stringify({ clients: connectedClients }))
+  console.log(
+    `A client just connected. Total connected clients: ${connectedClients}`
+  )
 
   ws.on('message', (message) => {
     console.log('received: %s', message)
@@ -144,6 +148,27 @@ function createUdpPacket(ipAddress) {
 
   return buffer
 }
+
+app.post('/sendInputGain', (req, res) => {
+  const { channel, gain } = req.body
+
+  const commandID = 'S'.charCodeAt(0)
+  const para1 = 'g'.charCodeAt(0)
+  const para2 = channel.charCodeAt(0)
+
+  const bytes = new Float32Array([gain]).buffer
+  const mCmd = new Uint8Array(9)
+  mCmd[0] = mCmd.length - 1
+  mCmd[1] = commandID
+  mCmd[2] = para1
+  mCmd[3] = para2
+  mCmd.set(new Uint8Array(bytes), 4)
+  mCmd[8] = mCmd.reduce((a, b) => a + b, 0) - mCmd[0]
+
+  sockets.forEach((socket) => socket.write(mCmd))
+
+  res.send('Input gain sent')
+})
 
 function getLocalIp() {
   for (const name in interfaces) {
