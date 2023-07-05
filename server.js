@@ -4,15 +4,30 @@ const dgram = require('dgram')
 const net = require('net')
 const os = require('os')
 const WebSocket = require('ws')
+const sendInputGainRouter = require('./routes/sendInputGain')
+const sendInputMuteRouter = require('./routes/sendInputMute')
+const EventEmitter = require('events')
+let eventEmitter = new EventEmitter()
 
 const app = express()
 app.use(cors())
+app.use(express.json())
+app.use('/sendInputGain', sendInputGainRouter)
+app.use('/sendInputMute', sendInputMuteRouter)
+
+app.use(function (err, req, res, next) {
+  console.error(err.stack)
+  res.status(500).send('Something broke!')
+})
+
 const wss = new WebSocket.Server({ port: 8080 })
 
 const interfaces = os.networkInterfaces()
 let tcpServer
 let sockets = []
 let connectedClients = 0
+// Buffer for handling incomplete messages
+let recvBuffer = Buffer.alloc(0)
 
 wss.on('connection', (ws) => {
   console.log('웹소켓 연결확인')
@@ -78,8 +93,26 @@ app.get('/start', (req, res) => {
     })
 
     socket.on('data', (data) => {
-      console.log('Received data from client: ', data)
+      recvBuffer = Buffer.concat([recvBuffer, data])
+
+      while (recvBuffer.length > 0) {
+        const messageLength = recvBuffer[0]
+
+        if (recvBuffer.length >= messageLength + 1) {
+          const message = recvBuffer.slice(1, messageLength + 1)
+          console.log('Received data from client: ', message)
+
+          eventEmitter.emit('dataReceived', message) // Emitting event when data is received
+
+          // Remove the processed message from the buffer
+          recvBuffer = recvBuffer.slice(messageLength + 1)
+        } else {
+          // If the full message has not yet been received, wait for the next 'data' event
+          break
+        }
+      }
     })
+    app.set('sockets', sockets)
   })
 
   tcpServer.listen(5001, () => {
@@ -149,27 +182,6 @@ function createUdpPacket(ipAddress) {
   return buffer
 }
 
-app.post('/sendInputGain', (req, res) => {
-  const { channel, gain } = req.body
-
-  const commandID = 'S'.charCodeAt(0)
-  const para1 = 'g'.charCodeAt(0)
-  const para2 = channel.charCodeAt(0)
-
-  const bytes = new Float32Array([gain]).buffer
-  const mCmd = new Uint8Array(9)
-  mCmd[0] = mCmd.length - 1
-  mCmd[1] = commandID
-  mCmd[2] = para1
-  mCmd[3] = para2
-  mCmd.set(new Uint8Array(bytes), 4)
-  mCmd[8] = mCmd.reduce((a, b) => a + b, 0) - mCmd[0]
-
-  sockets.forEach((socket) => socket.write(mCmd))
-
-  res.send('Input gain sent')
-})
-
 function getLocalIp() {
   for (const name in interfaces) {
     for (const interface of interfaces[name]) {
@@ -180,4 +192,86 @@ function getLocalIp() {
     }
   }
   return null
+}
+let count = 0
+app.post('/sendStatusRequestCommon', (req, res) => {
+  const { para2, ch } = req.body
+
+  const commandID = 'R'.charCodeAt(0)
+  const para1 = 'R'.charCodeAt(0)
+  const mCmd = new Uint8Array(6)
+
+  mCmd[0] = mCmd.length - 1
+  mCmd[1] = commandID
+  mCmd[2] = para1
+  mCmd[3] = para2.charCodeAt(0)
+  mCmd[4] = ch.charCodeAt(0)
+  mCmd[5] = mCmd.reduce((a, b) => a + b, 0) - mCmd[0]
+
+  const socketsCount = req.app.get('sockets').length
+  console.log('socketsCount: ', socketsCount)
+
+  req.app.get('sockets').forEach((socket) => {
+    count++
+    console.log('count: ', count)
+
+    socket.write(mCmd)
+  })
+
+  // Listen for the dataReceived event and send response
+  eventEmitter.once('dataReceived', (message) => {
+    let hexString = message.toString('hex')
+    let hexArray = hexString.match(/.{1,2}/g).map((byte) => '0x' + byte)
+    console.log('message: ', hexArray)
+
+    // Check if the array contains 0x52 0x67 0x31
+    if (
+      hexArray.slice(0, 3).toString() === ['0x52', '0x67', '0x31'].toString()
+    ) {
+      let hexValue = hexArray.slice(3, 7).join('').replace(/0x/g, '')
+      console.log('hexValue: ', hexValue)
+      let floatValue = hexToFloat(hexValue) // Convert the hex value to float
+      console.log('spk1ch1 value:', floatValue)
+    }
+    if (
+      hexArray.slice(0, 3).toString() === ['0x52', '0x67', '0x32'].toString()
+    ) {
+      let hexValue = hexArray.slice(3, 7).join('').replace(/0x/g, '')
+      console.log('hexValue: ', hexValue)
+      let floatValue = hexToFloat(hexValue) // Convert the hex value to float
+      console.log('spk1ch2 value:', floatValue)
+    }
+
+    if (
+      hexArray.slice(0, 3).toString() === ['0x52', '0x74', '0x31'].toString()
+    ) {
+      // hexArray[3] == 00 -> mute off, 01 -> mute on
+      console.log('spk1ch1 mute:', hexArray[3] === '0x01')
+    }
+    if (
+      hexArray.slice(0, 3).toString() === ['0x52', '0x74', '0x32'].toString()
+    ) {
+      // hexArray[3] == 00 -> mute off, 01 -> mute on
+      console.log('spk1ch2 mute:', hexArray[3] === '0x01')
+    }
+
+    let result = {}
+
+    //if msg contain 0x52 0x67 0x31  ->
+
+    res.json('ok') // Sending the response back to client
+  })
+})
+
+function hexToFloat(hex) {
+  // Convert hex to byte array in reverse order
+  let byteArray = hex
+    .match(/[\da-f]{2}/gi)
+    .map((h) => parseInt(h, 16))
+    .reverse()
+
+  const uint8array = new Uint8Array(byteArray)
+  const dataView = new DataView(uint8array.buffer)
+
+  return dataView.getFloat32(0, true) // true for little endian
 }
